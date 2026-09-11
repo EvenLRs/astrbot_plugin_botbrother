@@ -93,17 +93,13 @@ cp -r astrbot_plugin_botbrother <AstrBot目录>/data/plugins/
 | 本质 | AstrBot Bots 中平台实例的唯一 ID（添加 Bot 时自定义） | 被监视机器人的 QQ 号（self_id） |
 | 作用 | 定位平台实例，发起 `get_status` 探测 | 过滤事件，只处理该机器人的事件 |
 | 典型取值 | `napcat1` | `123456789` |
-| 为什么必须显式配置 | `Context.get_platform_inst()` 按该 ID 精确匹配；多实例时只有显式指定才能保证目标唯一 | 事件携带 `self_id`，用它确认事件确实来自目标机器人 |
-
-`platform_id` 不是适配器类型名 `aiocqhttp`。填错时插件找不到平台实例，会持续判定「连接/服务不可达」，配置错误因此会被暴露出来。
+| 为什么必须显式配置 | 多实例时只有显式指定才能保证目标唯一 | 用它确认事件确实来自目标机器人 |
 
 ### 如何取得 notify_targets
 
 `notify_targets` 的每一项都是 AstrBot 的 `unified_msg_origin`（统一会话标识），格式为 `{platform_id}:{消息类型}:{会话ID}`。
 
-**可以填 AstrBot 中任意平台的会话，不限于被监视的 OneBot/NapCat 实例。** 消息类型段（`GroupMessage`/`FriendMessage` 等）由目标平台的适配器决定。
-
-推荐选择与被监视 QQ 账号**相互独立**的通道（例如平台实例 `weixin_personal_icry` 的微信会话）：这样即使被监视账号掉线、NapCat 崩溃，告警依然能送达。当然也可以把告警发到被监视机器人自己的其他群——只是该账号掉线期间这类目标会收不到。
+推荐选择与被监视 QQ 账号**相互独立**的通道（例如平台实例 `weixin_personal_icry` 的微信会话）：这样即使被监视账号掉线、NapCat 崩溃，告警依然能送达。
 
 两种拿法：
 
