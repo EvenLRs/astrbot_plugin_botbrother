@@ -1,0 +1,5 @@
+name: astrbot_plugin_botbrother
+display_name: BotBrother 在线监视
+desc: 单实例 NapCat/OneBot 在线监视：区分账号下线与连接/服务不可达，去抖告警与恢复通知。
+author: AstrBot Team
+version: 1.0.0
