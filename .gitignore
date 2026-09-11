@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行期数据（本插件持久化到 AstrBot 的 data/plugin_data/，不在插件目录内；
+# 此处仅兜底忽略插件目录内可能产生的本地数据）
+data/
+*.state.json
+state.json
+state.json.tmp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 本地测试缓存
+.pytest_cache/

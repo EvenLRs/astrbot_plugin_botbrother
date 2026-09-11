@@ -1,0 +1,42 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "是否启用在线监视。",
+    "default": true
+  },
+  "target_self_id": {
+    "type": "string",
+    "description": "要监视的机器人 self_id（QQ 号），必填。",
+    "default": ""
+  },
+  "platform_id": {
+    "type": "string",
+    "description": "AstrBot Bots 中 OneBot 平台实例的 ID（平台实例的唯一 id，在 AstrBot 配置 Bots 时自定义，默认不一定等于 aiocqhttp），必填；用于定位平台实例并发起 get_status 探测。",
+    "default": ""
+  },
+  "interval_seconds": {
+    "type": "int",
+    "description": "状态探测间隔（秒），范围 5–86400。",
+    "default": 30
+  },
+  "debounce": {
+    "type": "int",
+    "description": "连续 N 次故障（或恢复）才推送通知，范围 1–10。",
+    "default": 3
+  },
+  "probe_timeout_seconds": {
+    "type": "int",
+    "description": "单次状态探测超时（秒），范围 1–60。",
+    "default": 5
+  },
+  "notify_targets": {
+    "type": "list",
+    "description": "告警推送目标列表（unified_msg_origin），格式 {platform_id}:{消息类型}:{会话ID}。可用 AstrBot 中任意平台的会话（不限于被监视的 OneBot/NapCat 实例），推荐使用与被监视账号独立的通道（如微信），确保其离线时告警仍能送达。至少填一个。",
+    "default": []
+  },
+  "persist_state": {
+    "type": "bool",
+    "description": "在 data 目录持久化故障状态，避免插件重载后重复告警。",
+    "default": true
+  }
+}
