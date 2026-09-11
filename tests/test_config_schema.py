@@ -30,7 +30,11 @@ class SchemaConsistencyTest(unittest.TestCase):
 class ValidConfigTest(unittest.TestCase):
     def test_defaults_applied(self):
         cfg, errors = validate_config(
-            {"target_self_id": "1", "platform_id": "napcat01", "notify_targets": ["a:b:c"]}
+            {
+                "target_self_id": "1",
+                "platform_id": "napcat01",
+                "notify_targets": ["a:b:c"],
+            }
         )
         self.assertEqual(errors, [])
         self.assertEqual(cfg["interval_seconds"], 30)
@@ -92,10 +96,10 @@ class InvalidConfigTest(unittest.TestCase):
     def test_empty_segment_targets_rejected(self):
         """含空段的 unified_msg_origin 必须拒绝（否则表面启动、实际无法发送）。"""
         for bad in (
-            "wechat::id",           # 消息类型段为空
-            ":FriendMessage:id",    # 平台段为空
+            "wechat::id",  # 消息类型段为空
+            ":FriendMessage:id",  # 平台段为空
             "wechat:FriendMessage:",  # 会话段为空
-            "wechat: :id",          # 消息类型段仅空白
+            "wechat: :id",  # 消息类型段仅空白
         ):
             cfg, errors = validate_config(
                 {
@@ -191,10 +195,31 @@ class InvalidConfigTest(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(cfg["notify_targets"]), 2)
 
+    def test_non_iterable_notify_targets_reports_error_without_raising(self):
+        """畸形 notify_targets（int/bool/float/dict）不得抛 TypeError 中断初始化。"""
+        for bad in (123, True, 3.14, {"a": 1}, object()):
+            with self.subTest(bad=bad):
+                cfg, errors = validate_config(
+                    {
+                        "target_self_id": "1",
+                        "platform_id": "napcat1",
+                        "notify_targets": bad,
+                    }
+                )
+                self.assertTrue(
+                    any("notify_targets" in e for e in errors),
+                    f"{bad!r} 应产生明确校验错误",
+                )
+                self.assertEqual(cfg["notify_targets"], [])
+
 
 class ClampTest(unittest.TestCase):
     def _valid(self, **overrides):
-        base = {"target_self_id": "1", "platform_id": "napcat1", "notify_targets": ["a:b:c"]}
+        base = {
+            "target_self_id": "1",
+            "platform_id": "napcat1",
+            "notify_targets": ["a:b:c"],
+        }
         base.update(overrides)
         return base
 
@@ -211,9 +236,7 @@ class ClampTest(unittest.TestCase):
         self.assertEqual(cfg["debounce"], 1)
 
     def test_bad_types_fall_back_to_defaults(self):
-        cfg, _ = validate_config(
-            self._valid(interval_seconds="abc", debounce=None)
-        )
+        cfg, _ = validate_config(self._valid(interval_seconds="abc", debounce=None))
         self.assertEqual(cfg["interval_seconds"], DEFAULTS["interval_seconds"])
         self.assertEqual(cfg["debounce"], DEFAULTS["debounce"])
 
