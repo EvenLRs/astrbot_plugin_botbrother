@@ -24,6 +24,11 @@ HAS_ASTRBOT = importlib.util.find_spec("astrbot") is not None
 if HAS_ASTRBOT:
     from astrbot.api.all import AstrBotConfig, MessageChain
     from astrbot.core.star.context import Context
+    from astrbot.core.star.filter.command import CommandFilter
+    from astrbot.core.star.filter.permission import (
+        PermissionType,
+        PermissionTypeFilter,
+    )
     from astrbot.core.star.filter.platform_adapter_type import (
         PlatformAdapterType,
         PlatformAdapterTypeFilter,
@@ -92,15 +97,32 @@ class PluginRegistrationTest(unittest.TestCase):
         self.assertIsNotNone(md, "AIOCQHTTP 事件处理器应已注册")
         self.assertEqual(md.event_type, EventType.AdapterMessageEvent)
         filters = [
-            f
-            for f in md.event_filters
-            if isinstance(f, PlatformAdapterTypeFilter)
+            f for f in md.event_filters if isinstance(f, PlatformAdapterTypeFilter)
         ]
         self.assertTrue(filters, "应存在平台适配器过滤器")
         self.assertTrue(
             filters[0].platform_type & PlatformAdapterType.AIOCQHTTP,
             "过滤器应只接受 AIOCQHTTP",
         )
+
+    def test_test_notification_command_registered_admin_only(self):
+        """测试通知指令须注册为 /botbrother_test，并带 ADMIN 权限过滤器。"""
+        full_name = get_handler_full_name(
+            self.main.BotBrotherMonitor.on_test_notification
+        )
+        md = star_handlers_registry.get_handler_by_full_name(full_name)
+        self.assertIsNotNone(md, "管理员测试通知指令应已注册")
+        cmd_filters = [f for f in md.event_filters if isinstance(f, CommandFilter)]
+        self.assertTrue(cmd_filters, "应存在指令过滤器")
+        self.assertIn(
+            self.main.TEST_COMMAND_NAME,
+            cmd_filters[0].get_complete_command_names(),
+        )
+        perm_filters = [
+            f for f in md.event_filters if isinstance(f, PermissionTypeFilter)
+        ]
+        self.assertTrue(perm_filters, "应存在权限过滤器")
+        self.assertEqual(perm_filters[0].permission_type, PermissionType.ADMIN)
 
 
 @unittest.skipUnless(HAS_ASTRBOT, "AstrBot 未安装，跳过集成冒烟测试")
@@ -191,11 +213,16 @@ class LifecycleSmokeTest(unittest.TestCase):
             # unreachable: no platform instance
             ctx2 = object.__new__(Context)
             ctx2.platform_manager = SimpleNamespace(platform_insts=[])
-            plugin2 = self.main.BotBrotherMonitor(ctx2, {
-                "enabled": True, "target_self_id": "1",
-                "platform_id": "aiocqhttp",
-                "notify_targets": ["a:b:c"], "persist_state": False,
-            })
+            plugin2 = self.main.BotBrotherMonitor(
+                ctx2,
+                {
+                    "enabled": True,
+                    "target_self_id": "1",
+                    "platform_id": "aiocqhttp",
+                    "notify_targets": ["a:b:c"],
+                    "persist_state": False,
+                },
+            )
             await plugin2.initialize()
             state, detail = await plugin2._probe()
             self.assertEqual(state, UNREACHABLE)
@@ -293,32 +320,42 @@ class LifecycleSmokeTest(unittest.TestCase):
 
         async def run():
             ctx = object.__new__(Context)
-            ctx.platform_manager = SimpleNamespace(platform_insts=[
-                FlakyPlatform("bad_channel", True),
-                FlakyPlatform("good_channel", False),
-            ])
-            plugin = self.main.BotBrotherMonitor(ctx, {
-                "enabled": True,
-                "target_self_id": "776916629",
-                "platform_id": "napcat",
-                "notify_targets": [
-                    "bad_channel:GroupMessage:1",
-                    "good_channel:FriendMessage:2",
-                ],
-                "persist_state": False,
-            })
+            ctx.platform_manager = SimpleNamespace(
+                platform_insts=[
+                    FlakyPlatform("bad_channel", True),
+                    FlakyPlatform("good_channel", False),
+                ]
+            )
+            plugin = self.main.BotBrotherMonitor(
+                ctx,
+                {
+                    "enabled": True,
+                    "target_self_id": "776916629",
+                    "platform_id": "napcat",
+                    "notify_targets": [
+                        "bad_channel:GroupMessage:1",
+                        "good_channel:FriendMessage:2",
+                    ],
+                    "persist_state": False,
+                },
+            )
             await plugin.initialize()
             for _ in range(3):
                 state, detail = await plugin._probe()
                 await plugin._feed_and_notify(state, detail)
             self.assertEqual(len(sent), 1, "正常目标应收到告警")
             self.assertEqual(sent[0], "good_channel:FriendMessage:2")
-            self.assertEqual(tried[0], "bad_channel:GroupMessage:1",
-                             "故障目标也应被尝试过")
-            self.assertEqual(tried, [
-                "bad_channel:GroupMessage:1",
-                "good_channel:FriendMessage:2",
-            ], "故障目标不得阻塞后续目标")
+            self.assertEqual(
+                tried[0], "bad_channel:GroupMessage:1", "故障目标也应被尝试过"
+            )
+            self.assertEqual(
+                tried,
+                [
+                    "bad_channel:GroupMessage:1",
+                    "good_channel:FriendMessage:2",
+                ],
+                "故障目标不得阻塞后续目标",
+            )
             await plugin.terminate()
 
         asyncio.run(run())
@@ -340,15 +377,17 @@ class LifecycleSmokeTest(unittest.TestCase):
 
         async def run():
             ctx = object.__new__(Context)
-            ctx.platform_manager = SimpleNamespace(
-                platform_insts=[FakePlatform()])
-            plugin = self.main.BotBrotherMonitor(ctx, {
-                "enabled": True,
-                "target_self_id": "776916629",
-                "platform_id": "napcat",
-                "notify_targets": ["ghost_platform:GroupMessage:1"],
-                "persist_state": False,
-            })
+            ctx.platform_manager = SimpleNamespace(platform_insts=[FakePlatform()])
+            plugin = self.main.BotBrotherMonitor(
+                ctx,
+                {
+                    "enabled": True,
+                    "target_self_id": "776916629",
+                    "platform_id": "napcat",
+                    "notify_targets": ["ghost_platform:GroupMessage:1"],
+                    "persist_state": False,
+                },
+            )
             await plugin.initialize()
             for _ in range(3):
                 state, detail = await plugin._probe()
@@ -374,16 +413,18 @@ class LifecycleSmokeTest(unittest.TestCase):
 
         async def run():
             ctx = object.__new__(Context)
-            ctx.platform_manager = SimpleNamespace(
-                platform_insts=[FakePlatform()])
-            plugin = self.main.BotBrotherMonitor(ctx, {
-                "enabled": True,
-                "target_self_id": "776916629",
-                "platform_id": "napcat",
-                # 结构合法（3 段），但消息类型枚举非法 -> from_str 抛 ValueError
-                "notify_targets": ["napcat:NotAType:1"],
-                "persist_state": False,
-            })
+            ctx.platform_manager = SimpleNamespace(platform_insts=[FakePlatform()])
+            plugin = self.main.BotBrotherMonitor(
+                ctx,
+                {
+                    "enabled": True,
+                    "target_self_id": "776916629",
+                    "platform_id": "napcat",
+                    # 结构合法（3 段），但消息类型枚举非法 -> from_str 抛 ValueError
+                    "notify_targets": ["napcat:NotAType:1"],
+                    "persist_state": False,
+                },
+            )
             await plugin.initialize()
             for _ in range(3):
                 state, detail = await plugin._probe()
@@ -419,13 +460,16 @@ class LifecycleSmokeTest(unittest.TestCase):
             ctx = object.__new__(Context)
             insts = [FakePlatform("my_napcat", "aiocqhttp")]
             ctx.platform_manager = SimpleNamespace(platform_insts=insts)
-            plugin = self.main.BotBrotherMonitor(ctx, {
-                "enabled": True,
-                "target_self_id": "123456",
-                "platform_id": "my_napcat",  # 用户自定义的平台实例 ID
-                "notify_targets": ["my_napcat:GroupMessage:10001"],
-                "persist_state": False,
-            })
+            plugin = self.main.BotBrotherMonitor(
+                ctx,
+                {
+                    "enabled": True,
+                    "target_self_id": "123456",
+                    "platform_id": "my_napcat",  # 用户自定义的平台实例 ID
+                    "notify_targets": ["my_napcat:GroupMessage:10001"],
+                    "persist_state": False,
+                },
+            )
             await plugin.initialize()
             self.assertEqual(plugin._platform_id, "my_napcat")
             state, _ = await plugin._probe()
@@ -459,13 +503,16 @@ class LifecycleSmokeTest(unittest.TestCase):
             ctx.platform_manager = SimpleNamespace(
                 platform_insts=[FakePlatform("real_napcat", "aiocqhttp")]
             )
-            plugin = self.main.BotBrotherMonitor(ctx, {
-                "enabled": True,
-                "target_self_id": "123456",
-                "platform_id": "other",
-                "notify_targets": ["a:b:c"],
-                "persist_state": False,
-            })
+            plugin = self.main.BotBrotherMonitor(
+                ctx,
+                {
+                    "enabled": True,
+                    "target_self_id": "123456",
+                    "platform_id": "other",
+                    "notify_targets": ["a:b:c"],
+                    "persist_state": False,
+                },
+            )
             await plugin.initialize()
             state, detail = await plugin._probe()
             self.assertEqual(state, UNREACHABLE)
@@ -502,17 +549,22 @@ class LifecycleSmokeTest(unittest.TestCase):
             bot_a = FakeBot("bot_a")
             bot_b = FakeBot("bot_b")
             ctx = object.__new__(Context)
-            ctx.platform_manager = SimpleNamespace(platform_insts=[
-                FakePlatform("napcat_a", "aiocqhttp", bot_a),
-                FakePlatform("napcat_b", "aiocqhttp", bot_b),
-            ])
-            plugin = self.main.BotBrotherMonitor(ctx, {
-                "enabled": True,
-                "target_self_id": "123456",
-                "platform_id": "napcat_b",
-                "notify_targets": ["napcat_b:GroupMessage:10001"],
-                "persist_state": False,
-            })
+            ctx.platform_manager = SimpleNamespace(
+                platform_insts=[
+                    FakePlatform("napcat_a", "aiocqhttp", bot_a),
+                    FakePlatform("napcat_b", "aiocqhttp", bot_b),
+                ]
+            )
+            plugin = self.main.BotBrotherMonitor(
+                ctx,
+                {
+                    "enabled": True,
+                    "target_self_id": "123456",
+                    "platform_id": "napcat_b",
+                    "notify_targets": ["napcat_b:GroupMessage:10001"],
+                    "persist_state": False,
+                },
+            )
             await plugin.initialize()
             self.assertEqual(plugin._platform_id, "napcat_b")
             state, _ = await plugin._probe()
@@ -544,17 +596,22 @@ class LifecycleSmokeTest(unittest.TestCase):
 
         async def run():
             ctx = object.__new__(Context)
-            ctx.platform_manager = SimpleNamespace(platform_insts=[
-                FakePlatform("shared_id", "qqchannel"),  # 同 ID 但非 aiocqhttp
-                FakePlatform("napcat1", "aiocqhttp"),
-            ])
-            plugin = self.main.BotBrotherMonitor(ctx, {
-                "enabled": True,
-                "target_self_id": "123456",
-                "platform_id": "shared_id",
-                "notify_targets": ["a:b:c"],
-                "persist_state": False,
-            })
+            ctx.platform_manager = SimpleNamespace(
+                platform_insts=[
+                    FakePlatform("shared_id", "qqchannel"),  # 同 ID 但非 aiocqhttp
+                    FakePlatform("napcat1", "aiocqhttp"),
+                ]
+            )
+            plugin = self.main.BotBrotherMonitor(
+                ctx,
+                {
+                    "enabled": True,
+                    "target_self_id": "123456",
+                    "platform_id": "shared_id",
+                    "notify_targets": ["a:b:c"],
+                    "persist_state": False,
+                },
+            )
             await plugin.initialize()
             state, detail = await plugin._probe()
             self.assertEqual(state, UNREACHABLE, "非 aiocqhttp 平台不得被绑定")
@@ -570,13 +627,16 @@ class LifecycleSmokeTest(unittest.TestCase):
                 meta=lambda: SimpleNamespace(id="qqchannel", name="qqchannel"),
             )
             ctx.platform_manager = SimpleNamespace(platform_insts=[other])
-            plugin = self.main.BotBrotherMonitor(ctx, {
-                "enabled": True,
-                "target_self_id": "1",
-                "platform_id": "some_id",
-                "notify_targets": ["a:b:c"],
-                "persist_state": False,
-            })
+            plugin = self.main.BotBrotherMonitor(
+                ctx,
+                {
+                    "enabled": True,
+                    "target_self_id": "1",
+                    "platform_id": "some_id",
+                    "notify_targets": ["a:b:c"],
+                    "persist_state": False,
+                },
+            )
             await plugin.initialize()
             state, detail = await plugin._probe()
             self.assertEqual(state, UNREACHABLE)

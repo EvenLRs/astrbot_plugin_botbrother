@@ -1,4 +1,4 @@
-"""插件配置 schema 与校验（纯 Python，零 AstrBot 依赖，可独立单测）。
+"""插件配置 schema 与校验。
 
 ``CONF_SCHEMA`` 与 ``_conf_schema.json`` 保持同步。
 """
@@ -66,7 +66,7 @@ TIMEOUT_MIN, TIMEOUT_MAX = 1, 60
 TARGET_ORIGIN_SEP = ":"
 # unified_msg_origin 结构：{platform_id}:{消息类型}:{会话ID}
 # 消息类型段由各平台适配器自行定义（GroupMessage/FriendMessage/OtherMessage/…），
-# 平台段可为 AstrBot 中任意平台，不做 aiocqhttp 限定，因此只校验分段结构。
+# 平台段可为 AstrBot 中任意平台，因此只校验分段结构。
 MIN_SEGMENTS = 3
 
 
@@ -105,7 +105,9 @@ def validate_config(raw: dict | None) -> tuple[dict, list[str]]:
     target = str(raw.get("target_self_id", "") or "").strip()
     cfg["target_self_id"] = target
     if not target:
-        errors.append("target_self_id 不能为空：请填写要监视的机器人 QQ 号（self_id）。")
+        errors.append(
+            "target_self_id 不能为空：请填写要监视的机器人 QQ 号（self_id）。"
+        )
 
     platform_id = str(raw.get("platform_id", "") or "").strip()
     cfg["platform_id"] = platform_id
@@ -116,7 +118,10 @@ def validate_config(raw: dict | None) -> tuple[dict, list[str]]:
         )
 
     cfg["interval_seconds"] = _clamp_int(
-        raw.get("interval_seconds"), INTERVAL_MIN, INTERVAL_MAX, DEFAULTS["interval_seconds"]
+        raw.get("interval_seconds"),
+        INTERVAL_MIN,
+        INTERVAL_MAX,
+        DEFAULTS["interval_seconds"],
     )
     cfg["debounce"] = _clamp_int(
         raw.get("debounce"), DEBOUNCE_MIN, DEBOUNCE_MAX, DEFAULTS["debounce"]
@@ -133,6 +138,14 @@ def validate_config(raw: dict | None) -> tuple[dict, list[str]]:
         targets = []
     if isinstance(targets, str):
         targets = [targets]
+    # 畸形配置（int/bool/dict 等非序列值）不得让校验抛 TypeError 中断初始化：
+    # 统一降级为空列表并报明确错误，由调用方记录后拒绝启动。
+    if not isinstance(targets, (list, tuple)):
+        errors.append(
+            f"notify_targets 必须是列表（当前为 {type(targets).__name__}）："
+            "请填写至少一个 unified_msg_origin，格式 platform_id:消息类型:会话ID。"
+        )
+        targets = []
     clean: list[str] = []
     for t in targets:
         s = str(t).strip()

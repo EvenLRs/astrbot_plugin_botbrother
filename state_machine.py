@@ -1,4 +1,4 @@
-"""BotBrother 核心监视状态机（纯 Python，零 AstrBot 依赖，可独立单测）。
+"""BotBrother 核心监视状态机。
 
 状态
 ----
@@ -13,7 +13,7 @@
 - ``"unreachable"``  探测失败/超时（连接/服务不可达）
 - ``"activity"``     被动活性信号：收到匹配 self_id 的 AIOCQHTTP 事件（事件能到达即证明在线）
 
-语义（与 BotBrother 核心等价）
+语义
 ------------------------------
 * 在线态：连续 ``debounce`` 次非在线信号才进入对应故障态（按故障种类各自累计；
   期间任意一次在线信号清零计数，即 cross-clear）。进入故障态即告警一次。
@@ -36,6 +36,67 @@ UNREACHABLE = "unreachable"
 
 # 输入信号常量
 ACTIVITY = "activity"
+
+# 合法状态集合（快照校验用）
+VALID_STATES = (ONLINE, OFFLINE, UNREACHABLE)
+# 故障态 / 允许的 pending_kind（不得为 ONLINE：在线态不会作为待定故障种类）
+_FAULT_STATES = (OFFLINE, UNREACHABLE)
+_PENDING_KINDS = ("", OFFLINE, UNREACHABLE)
+
+# 快照字段清单（to_snapshot 的输出即验收基准；多余未知键忽略，缺失即视为坏快照）
+_SNAPSHOT_FIELDS = (
+    "state",
+    "ever_alerted",
+    "ever_recovered",
+    "pending_fault",
+    "pending_kind",
+    "pending_ok",
+    "last_detail",
+)
+
+
+def _is_nonneg_int(value) -> bool:
+    """是否合法的非负计数器：仅接受真正的 int（排除 bool），不做事后强转。
+
+    - bool 是 int 子类，必须显式排除（True 会被误当 1）。
+    - 不接受 str/float 等强转（"3"、3.0、float('inf') 一律视为非法，
+      同时避免 int(float('inf')) 抛 OverflowError）。
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _snapshot_is_valid(snapshot) -> bool:
+    """快照是否可安全恢复：字段齐全 + 类型严格 + 无自相矛盾。
+
+    计数不按 debounce 卡上限：用户调小 debounce 后，旧快照里更大的合法
+    计数应继续生效（下一轮即触发），不得因“超出当前 debounce”被拒绝。
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    if any(key not in snapshot for key in _SNAPSHOT_FIELDS):
+        return False
+    if snapshot["state"] not in VALID_STATES:
+        return False
+    if not isinstance(snapshot["ever_alerted"], bool):
+        return False
+    if not isinstance(snapshot["ever_recovered"], bool):
+        return False
+    if not _is_nonneg_int(snapshot["pending_fault"]):
+        return False
+    if not _is_nonneg_int(snapshot["pending_ok"]):
+        return False
+    if snapshot["pending_kind"] not in _PENDING_KINDS:
+        return False
+    if not isinstance(snapshot["last_detail"], str):
+        return False
+    # 矛盾一：故障态却从未告警（正常进入故障态必置 ever_alerted=True）
+    if snapshot["state"] in _FAULT_STATES and not snapshot["ever_alerted"]:
+        return False
+    # 矛盾二：从未告警却标记已恢复
+    if snapshot["ever_recovered"] and not snapshot["ever_alerted"]:
+        return False
+    return True
+
 
 # 通知文案（单条完整文案，含 [BotBrother] 前缀；self_id 由调用方填入）
 ALERT_TITLES = {
@@ -195,13 +256,25 @@ class MonitorStateMachine:
 
     @classmethod
     def from_snapshot(cls, snapshot: dict, debounce: int = 3) -> "MonitorStateMachine":
-        """从快照恢复状态机（用于插件重载后避免重复告警）。"""
-        machine = cls(debounce=debounce)
-        machine.state = snapshot.get("state", ONLINE)
-        machine._ever_alerted = bool(snapshot.get("ever_alerted", False))
-        machine._ever_recovered = bool(snapshot.get("ever_recovered", False))
-        machine._counters.pending_fault = int(snapshot.get("pending_fault", 0))
-        machine._counters.pending_kind = snapshot.get("pending_kind", "")
-        machine._counters.pending_ok = int(snapshot.get("pending_ok", 0))
-        machine._last_detail = str(snapshot.get("last_detail", ""))
-        return machine
+        """从快照恢复状态机（用于插件重载后避免重复告警）。
+
+        快照来自磁盘，可能被截断/手改/版本不兼容。验收标准：
+        - ``to_snapshot()`` 的真实往返必须原样恢复（含故障态与去抖计数）；
+        - 任何字段缺失、类型非法（如 ever_alerted 为 str/1）、计数为
+          bool/负数/float、pending_kind 为 ONLINE，或状态与标志自相矛盾时，
+          **整体回退全新状态机**——绝不部分继承损坏的计数或历史标志，
+          也不因坏快照让插件初始化失败。
+        - 计数不按 debounce 卡上限，debounce 调小后旧快照的合法大计数继续生效。
+        """
+        if _snapshot_is_valid(snapshot):
+            machine = cls(debounce=debounce)
+            machine.state = snapshot["state"]
+            machine._ever_alerted = snapshot["ever_alerted"]
+            machine._ever_recovered = snapshot["ever_recovered"]
+            machine._counters.pending_fault = snapshot["pending_fault"]
+            machine._counters.pending_kind = snapshot["pending_kind"]
+            machine._counters.pending_ok = snapshot["pending_ok"]
+            machine._last_detail = snapshot["last_detail"]
+            return machine
+        # 非法或矛盾快照：全新状态机（state=ONLINE，计数/标志清零）
+        return cls(debounce=debounce)
