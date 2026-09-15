@@ -2,5 +2,5 @@ name: astrbot_plugin_botbrother
 display_name: BotBrother
 desc: QQ账号在线状态监视，账号离线或OneBot服务端失联时通过指定渠道通知用户
 author: EvenLRs
-version: 0.1.1
+version: 0.1.2
 astrbot_version: ">=4.16.0"

@@ -15,6 +15,8 @@
   * 账号下线（OFFLINE）：get_status 成功但 online=false（QQ 登录态掉线）；
   * 连接/服务不可达（UNREACHABLE）：调用失败/超时/无平台实例。
 - 推送一律走 AstrBot Context/平台 API（``context.send_message``）；目标可为 AstrBot 中任意平台的会话（unified_msg_origin）。逐目标独立尝试并带超时，单个目标失败/挂起仅记录日志，不影响其余目标，取消信号照常向上传播。
+- 告警可靠性：探测/事件只把告警写入待发送队列（始终外置 data 目录），由生命周期受管的独立 worker 负责有限并发发送，按“每目标 FIFO + 有界指数退避”重试；发送与探测解耦，单目标失败/挂起不拖慢探测或其它目标。该兜底不是“保证不丢”，也不等于及时预警。
+- 微信个人号（weixin_oc）：本插件走与定时任务/agent 相同的 ``Context.send_message`` 路径（不自建适配器、不使用 requests、不伪造/刷新 token）。适配器要求存在缓存的 context_token 且仅入站刷新，但“prepare failed = 过期”的结论已撤回，原始失败原因未证实；本插件的补发是可靠性加固，不等于根因解决。
 - 管理员指令 ``/botbrother_test``：仅管理员可用，向已配置的 notify_targets 发送测试通知并返回逐目标 发送调用完成/未找到目标平台/超时/失败 摘要；不依赖被监视账号在线、不要求监视已启动，也不改动状态机/快照、不触发故障告警。
 - 后台任务可取消、无泄漏；所有异常仅记录，不令插件崩溃。
 - 持久化写入 AstrBot 的 data/plugin_data/astrbot_plugin_botbrother/。
@@ -24,6 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import time
+import uuid
 from pathlib import Path
 
 from astrbot.api import logger
@@ -68,12 +73,27 @@ TEST_NOTIFICATION_TEXT = (
     "[BotBrother] 测试通知：用于验证通知渠道配置，不代表账号状态变化。"
 )
 
+# 告警待发送队列：交付失败的告警持久化于 data 目录，按目标 FIFO、有界重试。
+# 说明：这是“失败尽量不丢”的兜底，不是“保证不丢失”，也不等于及时预警；
+# 容量满/磁盘写失败均有边界（见 README）。发送由独立 worker 负责，与探测解耦。
+PENDING_FILE_NAME = "pending_notifications.json"
+PENDING_VERSION = 2
+PENDING_MAX_ENTRIES = 50
+# worker 每轮最多发起的发送尝试数（含各目标），避免一轮内无限尝试。
+PENDING_MAX_ATTEMPTS_PER_CYCLE = 3
+# worker 单轮的最大并发发送数（单目标超时/错误不拖慢其它目标）。
+PENDING_MAX_CONCURRENT_SENDS = 3
+# 单目标失败退避上限（秒）；退避为 interval * 2^(failures-1)，封顶此值。
+PENDING_BACKOFF_CAP_SECONDS = 3600
+# 退避指数前先截断失败次数，避免长期失败导致 2**n 指数爆炸/溢出。
+PENDING_BACKOFF_MAX_FAILURES = 10
+
 
 @register(
     name=PLUGIN_NAME,
     author="AstrBot Team",
     desc="单实例 NapCat/OneBot 在线监视：区分账号下线与连接/服务不可达，去抖告警与恢复通知。",
-    version="0.1.1",
+    version="0.1.2",
 )
 class BotBrotherMonitor(Star):
     """BotBrother 单实例在线监视插件。"""
@@ -91,6 +111,14 @@ class BotBrotherMonitor(Star):
         self._probe_timeout = 5
         self._data_dir: Path | None = None
         self._state_file: Path | None = None
+        # 待发送告警队列（内存 + data 目录持久化），按目标 FIFO、有界重试。
+        self._pending_file: Path | None = None
+        self._pending: list[dict] = []
+        # 每目标退避态：target -> {"failures": int, "next_at": epoch}
+        self._target_state: dict[str, dict] = {}
+        # 通知 worker：生命周期受管、只负责发送，与探测/事件路径解耦。
+        self._worker_task: asyncio.Task | None = None
+        self._worker_wakeup: asyncio.Event | None = None
         # 测试通知防重入：指令处理期间置 True，避免并发/重复触发叠加发送。
         self._test_in_flight = False
 
@@ -118,9 +146,18 @@ class BotBrotherMonitor(Star):
         # 不一定是 "aiocqhttp"）；必须与 get_platform_inst 的匹配键一致。
         self._platform_id = cfg["platform_id"]
 
+        # pending 队列始终外置到 data 目录（persist_state 只控制 state.json 快照）。
+        self._setup_data_dir(persist_state=cfg["persist_state"])
         if cfg["persist_state"]:
-            self._setup_data_dir()
             self._load_snapshot()
+        self._load_pending()
+
+        # 通知 worker：与探测解耦，负责从队列取件发送（可取消、可重载）。
+        self._worker_wakeup = asyncio.Event()
+        self._worker_task = asyncio.create_task(
+            self._worker_loop(), name=f"{PLUGIN_NAME}-notify"
+        )
+        self._wake_worker()  # 立即冲刷上次遗留的待发送队列
 
         self._task = asyncio.create_task(
             self._monitor_loop(), name=f"{PLUGIN_NAME}-monitor"
@@ -136,16 +173,20 @@ class BotBrotherMonitor(Star):
         )
 
     async def terminate(self) -> None:
-        """插件停用/热重载入口：取消后台任务，保存状态快照。"""
-        task, self._task = self._task, None
-        if task is not None:
+        """插件停用/热重载入口：取消后台任务与通知 worker，保存状态与队列。"""
+        for attr in ("_task", "_worker_task"):
+            task = getattr(self, attr)
+            setattr(self, attr, None)
+            if task is None:
+                continue
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass  # 我们主动取消，吞掉自身取消信号是预期行为
             except Exception as e:  # 任务收尾异常只记录，不中断停用流程
-                logger.warning("%s 监视任务退出时异常（已忽略）：%s", PLUGIN_NAME, e)
+                logger.warning("%s 后台任务退出时异常（已忽略）：%s", PLUGIN_NAME, e)
+        self._save_pending()
         self._save_snapshot()
         logger.info("%s 已停止。", PLUGIN_NAME)
 
@@ -269,8 +310,9 @@ class BotBrotherMonitor(Star):
         if notices:
             self._save_snapshot()
             for msg, _body in notices:
-                # 通知是含 [BotBrother] 前缀与 self_id 的完整文案，直接发送
-                await self._push(msg)
+                # 通知是含 [BotBrother] 前缀与 self_id 的完整文案；此处只入队，
+                # 由独立 worker 负责发送，避免发送阻塞探测/事件路径。
+                self._handle_alert(msg)
 
     async def _send_to_target(
         self, target: str, chain: MessageChain
@@ -301,41 +343,25 @@ class BotBrotherMonitor(Star):
             return "ok", ""
         return "false", "未找到目标平台（send_message 返回 False）"
 
-    async def _push(self, text: str) -> None:
-        """通过 AstrBot Context/平台 API 推送通知（不使用 requests）。
+    def _wake_worker(self) -> None:
+        """唤醒通知 worker（若已启动）。"""
+        if self._worker_wakeup is not None:
+            self._worker_wakeup.set()
 
-        text 为状态机给出的完整文案（含 [BotBrother] 前缀与 self_id），
-        此处不再拼接任何内容。目标可为 AstrBot 中任意平台的
-        unified_msg_origin（不限于被监视的 OneBot 实例）；逐目标独立尝试并带
-        超时（PUSH_TIMEOUT_SECONDS），单个目标失败/挂起仅记录日志，不影响
-        其余目标；取消信号照常向上传播。
+    def _handle_alert(self, title: str) -> None:
+        """告警通知：仅按目标入队（追加队尾），由独立 worker 异步发送。
+
+        新告警排在该目标既有待发条目之后（每目标 FIFO），不会跨过更早的
+        故障/恢复通知；不改变状态机/快照语义（快照已在调用前保存）。
+        此路径不做任何网络请求，因此不会阻塞探测与事件处理。
+        注意：队列是“尽量不丢”的兜底，不是“保证不丢失”，也不等于及时预警。
         """
-        targets = self._config.get("notify_targets") or []
-        chain = MessageChain([Plain(text=text)])
-        for target in targets:
-            status, detail = await self._send_to_target(target, chain)
-            if status == "ok":
-                continue
-            if status == "false":
-                logger.warning(
-                    "%s 推送目标 %s 未找到对应平台，消息未发送。",
-                    PLUGIN_NAME,
-                    target,
-                )
-            elif status == "timeout":
-                logger.error(
-                    "%s 推送超时 target=%s（>%ds，已跳过，继续后续目标）。",
-                    PLUGIN_NAME,
-                    target,
-                    PUSH_TIMEOUT_SECONDS,
-                )
-            else:
-                logger.error(
-                    "%s 推送失败 target=%s（已忽略，继续后续目标）：%s",
-                    PLUGIN_NAME,
-                    target,
-                    detail,
-                )
+        targets = list(self._config.get("notify_targets") or [])
+        if not targets:
+            logger.warning("%s 无可用推送目标，告警未发送。", PLUGIN_NAME)
+            return
+        self._enqueue_pending(title, targets)
+        self._wake_worker()
 
     # ------------------------------------------------------------------ #
     # 管理员测试通知指令（/botbrother_test）
@@ -368,6 +394,8 @@ class BotBrotherMonitor(Star):
         - 返回逐目标 发送调用完成/未找到目标平台/超时/失败 摘要；「发送调用
           完成」仅表示已调用适配器且目标平台已定位，不代表真实可达或用户已读，
           需结合适配器响应/日志确认。
+        - 复用与 worker 相同的诊断包装（每个目标输出 id，便于在日志中定位该次
+          发送）；测试发送不入队、不改退避计数、不影响补发队列。
         """
         # 运行时管理员复核（fail closed）：缺方法、非 callable、返回假值或
         # 调用抛异常，一律拒绝。声明式权限过滤器之外的兜底（如 alter_cmd 被
@@ -391,7 +419,6 @@ class BotBrotherMonitor(Star):
             )
 
         self._test_in_flight = True
-        chain = MessageChain([Plain(text=TEST_NOTIFICATION_TEXT)])
         labels = {
             "ok": "发送调用完成（请核对收件）",
             "false": "未找到目标平台",
@@ -402,10 +429,15 @@ class BotBrotherMonitor(Star):
         lines: list[str] = []
         try:
             for target in targets:
-                status, detail = await self._send_to_target(target, chain)
+                # 与 worker 复用同一诊断包装；测试发送不入队、不改退避计数。
+                status, detail, send_id = await self._send_with_diagnostics(
+                    target, TEST_NOTIFICATION_TEXT, attempt=1, source="test"
+                )
                 statuses.append(status)
                 suffix = f"（{detail}）" if detail else ""
-                lines.append(f"- {labels.get(status, status)}：{target}{suffix}")
+                lines.append(
+                    f"- {labels.get(status, status)}：{target}{suffix} [id={send_id}]"
+                )
         finally:
             self._test_in_flight = False
 
@@ -425,15 +457,24 @@ class BotBrotherMonitor(Star):
     # ------------------------------------------------------------------ #
     # 持久化（data/plugin_data/astrbot_plugin_botbrother/）
     # ------------------------------------------------------------------ #
-    def _setup_data_dir(self) -> None:
+    def _setup_data_dir(self, persist_state: bool = True) -> None:
         try:
             self._data_dir = StarTools.get_data_dir(PLUGIN_NAME)
             self._data_dir.mkdir(parents=True, exist_ok=True)
-            self._state_file = self._data_dir / "state.json"
+            # state.json 快照受 persist_state 控制；pending 队列始终外置。
+            self._state_file = (
+                (self._data_dir / "state.json") if persist_state else None
+            )
+            self._pending_file = self._data_dir / PENDING_FILE_NAME
         except Exception as e:
-            logger.warning("%s 无法创建数据目录，持久化已禁用：%s", PLUGIN_NAME, e)
+            logger.warning(
+                "%s 无法创建数据目录，快照与待发送队列降级为内存：%s",
+                PLUGIN_NAME,
+                e,
+            )
             self._data_dir = None
             self._state_file = None
+            self._pending_file = None
 
     def _save_snapshot(self) -> None:
         if self._state_file is None or self._machine is None:
@@ -469,3 +510,378 @@ class BotBrotherMonitor(Star):
             logger.warning(
                 "%s 状态快照加载失败，使用全新状态（已忽略）：%s", PLUGIN_NAME, e
             )
+
+    # ------------------------------------------------------------------ #
+    # 告警待发送队列（data 外置、按目标 FIFO、有界退避重试）
+    # ------------------------------------------------------------------ #
+    def _enqueue_pending(self, title: str, targets: list[str]) -> None:
+        """把告警追加到队尾（每目标 FIFO）；超容量时丢弃最旧并明确记录。"""
+        target_list = [t for t in targets if isinstance(t, str) and t.strip()]
+        if not target_list:
+            return
+        self._pending.append(
+            {
+                "id": uuid.uuid4().hex,
+                "ts": time.time(),
+                "title": title,
+                "targets": target_list,
+            }
+        )
+        dropped = 0
+        while len(self._pending) > PENDING_MAX_ENTRIES:
+            self._pending.pop(0)
+            dropped += 1
+        if dropped:
+            logger.error(
+                "%s 待发送告警超过容量 %d，已丢弃最旧的 %d 条（不保证不丢失）。",
+                PLUGIN_NAME,
+                PENDING_MAX_ENTRIES,
+                dropped,
+            )
+        self._save_pending()
+
+    def _save_pending(self) -> None:
+        if self._pending_file is None:
+            return
+        payload = {
+            "version": PENDING_VERSION,
+            "entries": self._pending,
+            "target_state": self._target_state,
+        }
+        try:
+            self._pending_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._pending_file.with_name(self._pending_file.name + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self._pending_file)
+        except Exception as e:
+            # 写盘失败只记日志：内存队列仍有效，但该次持久化丢失（有边界）。
+            logger.warning("%s 待发送队列持久化失败（已忽略）：%s", PLUGIN_NAME, e)
+
+    @staticmethod
+    def _clean_pending_entries(raw_entries: object) -> list[dict]:
+        clean: list[dict] = []
+        if not isinstance(raw_entries, list):
+            return clean
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title")
+            targets = item.get("targets")
+            if not isinstance(title, str) or not title:
+                continue
+            if not isinstance(targets, list):
+                continue
+            target_list = [t for t in targets if isinstance(t, str) and t.strip()]
+            if not target_list:
+                continue
+            ts = item.get("ts")
+            clean.append(
+                {
+                    "id": str(item.get("id") or uuid.uuid4().hex),
+                    "ts": ts
+                    if isinstance(ts, (int, float)) and not isinstance(ts, bool)
+                    else time.time(),
+                    "title": title,
+                    "targets": target_list,
+                }
+            )
+        return clean
+
+    @staticmethod
+    def _clean_target_state(raw_state: object) -> dict[str, dict]:
+        clean: dict[str, dict] = {}
+        if not isinstance(raw_state, dict):
+            return clean
+        for target, state in raw_state.items():
+            if not isinstance(target, str) or not target:
+                continue
+            if not isinstance(state, dict):
+                continue
+            failures = state.get("failures")
+            next_at = state.get("next_at")
+            # failures 必须是有界非负 int；next_at 必须是有限非负数值。
+            # 否则视为损坏：丢弃该退避态（而不是接受 inf/巨大值导致永久停发）。
+            failures_ok = (
+                isinstance(failures, int)
+                and not isinstance(failures, bool)
+                and 0 <= failures <= PENDING_BACKOFF_MAX_FAILURES
+            )
+            next_at_value: float | None = None
+            if isinstance(next_at, (int, float)) and not isinstance(next_at, bool):
+                try:
+                    candidate = float(next_at)
+                except (OverflowError, ValueError):
+                    # 例如合法 JSON 里超大的 int：float() 会 OverflowError，必须兜底。
+                    candidate = None
+                if (
+                    candidate is not None
+                    and math.isfinite(candidate)
+                    and candidate >= 0
+                ):
+                    next_at_value = candidate
+            if failures_ok and next_at_value is not None:
+                clean[target] = {"failures": failures, "next_at": next_at_value}
+        return clean
+
+    def _load_pending(self) -> None:
+        """载入待发送队列（兼容 v1 列表）；损坏/结构非法严格回退空。"""
+        if self._pending_file is None or not self._pending_file.exists():
+            return
+        try:
+            raw = json.loads(self._pending_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("%s 待发送队列加载失败（已忽略）：%s", PLUGIN_NAME, e)
+            self._pending = []
+            self._target_state = {}
+            return
+        try:
+            if isinstance(raw, dict) and isinstance(raw.get("entries"), list):
+                entries = raw["entries"]
+                target_state = self._clean_target_state(raw.get("target_state"))
+            elif isinstance(raw, list):  # 兼容旧 v1 列表格式
+                entries = raw
+                target_state = {}
+            else:
+                self._pending = []
+                self._target_state = {}
+                return
+            self._pending = self._clean_pending_entries(entries)[-PENDING_MAX_ENTRIES:]
+            self._target_state = target_state
+        except Exception as e:
+            # 任何清洗异常（含极端数值转换）都不得让初始化失败。
+            logger.warning("%s 待发送队列解析异常（已忽略）：%s", PLUGIN_NAME, e)
+            self._pending = []
+            self._target_state = {}
+
+    def _backoff_delay(self, failures: int) -> float:
+        base = max(int(self._config.get("interval_seconds", 30) or 30), 5)
+        # 先截断指数，避免长期失败时 2**n 指数爆炸/溢出。
+        capped = min(max(int(failures), 1), PENDING_BACKOFF_MAX_FAILURES)
+        return min(base * (2 ** (capped - 1)), PENDING_BACKOFF_CAP_SECONDS)
+
+    # ------------------------------------------------------------------ #
+    # 通知 worker（生命周期受管；与探测解耦）
+    # ------------------------------------------------------------------ #
+    def _next_wakeup_delay(self) -> float | None:
+        """worker 下次醒来延迟：None=队列空；0=有可立即尝试；>0=最近退避到期。"""
+        now = time.time()
+        soonest: float | None = None
+        for entry in self._pending:
+            for target in entry.get("targets") or []:
+                state = self._target_state.get(target) or {}
+                next_at = float(state.get("next_at", 0) or 0)
+                if next_at <= now:
+                    return 0.0
+                soonest = next_at if soonest is None else min(soonest, next_at)
+        if soonest is None:
+            return None
+        return max(0.0, soonest - now)
+
+    async def _worker_loop(self) -> None:
+        """通知 worker：只从队列取件发送；可取消、无泄漏、不参与探测。"""
+        wakeup = self._worker_wakeup
+        assert wakeup is not None
+        while True:
+            try:
+                delay = self._next_wakeup_delay()
+                if delay is None:
+                    await wakeup.wait()
+                elif delay > 0:
+                    try:
+                        await asyncio.wait_for(wakeup.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
+                wakeup.clear()
+                await self._drain_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # 仅记录，worker 自身不崩
+                logger.error("%s 通知 worker 异常（已忽略）：%s", PLUGIN_NAME, e)
+                await asyncio.sleep(1)
+
+    async def _send_with_diagnostics(
+        self,
+        target: str,
+        text: str,
+        *,
+        attempt: int = 1,
+        source: str = "worker",
+    ) -> tuple[str, str, str]:
+        """所有发送路径共享的诊断包装：返回 ``(status, detail, send_id)``。
+
+        - 输出结构化诊断日志（source / 关联 id / 目标 / 平台实例 / 尝试次数 /
+          耗时 / 状态 / 异常类型）。
+        - 不记录任何凭据、完整请求或 token；原始 ret/errmsg 经公开 API 不可得。
+        - 不做入队、不改退避计数——状态处理由调用方决定。
+        """
+        send_id = uuid.uuid4().hex[:12]
+        platform = target.split(":", 1)[0] if isinstance(target, str) else "?"
+        started = time.monotonic()
+        logger.info(
+            "%s 发送开始 id=%s source=%s target=%s platform=%s attempt=%d",
+            PLUGIN_NAME,
+            send_id,
+            source,
+            target,
+            platform,
+            attempt,
+        )
+        status, detail = await self._send_to_target(
+            target, MessageChain([Plain(text=text)])
+        )
+        elapsed = time.monotonic() - started
+        if status == "ok":
+            logger.info(
+                "%s 发送结果 id=%s source=%s target=%s status=ok elapsed=%.2fs"
+                "（仅表示适配器调用返回，不代表已读/最终投递）",
+                PLUGIN_NAME,
+                send_id,
+                source,
+                target,
+                elapsed,
+            )
+        else:
+            logger.warning(
+                "%s 发送结果 id=%s source=%s target=%s status=%s elapsed=%.2fs "
+                "detail=%s（原始 ret/errmsg 经公开 API 不可得；"
+                "请按时间/平台关联适配器日志）",
+                PLUGIN_NAME,
+                send_id,
+                source,
+                target,
+                status,
+                elapsed,
+                detail,
+            )
+        return status, detail, send_id
+
+    async def _attempt_send(self, entry: dict, target: str) -> tuple[str, str]:
+        """worker 单次发送：共享诊断包装 + 队列所需 (status, detail)。
+
+        诊断 id 仅写日志；FIFO/退避由 _drain_once 统一维护。
+        """
+        attempt = int((self._target_state.get(target) or {}).get("failures", 0)) + 1
+        status, detail, _send_id = await self._send_with_diagnostics(
+            target, entry.get("title", ""), attempt=attempt, source="worker"
+        )
+        return status, detail
+
+    async def _drain_once(self) -> None:
+        """单轮有界投递：每目标 FIFO + 有限并发 + 退避 + 公平。
+
+        - 每个目标每轮只尝试其最早的一条待发条目（保持 FIFO，坏目标不越级）。
+        - 每轮最多 PENDING_MAX_ATTEMPTS_PER_CYCLE 次尝试、至多
+          PENDING_MAX_CONCURRENT_SENDS 个并发；单目标超时/错误不影响其它目标。
+        - 失败目标进入指数退避；成功目标移除；不再配置的目标清除。
+        - 取消信号照常上抛（不吞 CancelledError）。
+        """
+        if not self._pending:
+            return
+        now = time.time()
+        configured = set(self._config.get("notify_targets") or [])
+        changed = False
+
+        # 1) 清理：空标题、已删除目标、孤立退避态
+        for entry in list(self._pending):
+            title = entry.get("title")
+            if not isinstance(title, str) or not title:
+                self._pending.remove(entry)
+                changed = True
+                continue
+            kept = [
+                t
+                for t in (entry.get("targets") or [])
+                if isinstance(t, str) and t in configured
+            ]
+            if kept != entry.get("targets"):
+                entry["targets"] = kept
+                changed = True
+            if not entry["targets"]:
+                self._pending.remove(entry)
+                changed = True
+        for target in list(self._target_state):
+            if target not in configured:
+                self._target_state.pop(target, None)
+                changed = True
+
+        # 2) 选取本轮可尝试的 (entry, target)：每目标取其最早条目
+        scheduled: list[tuple[dict, str]] = []
+        scheduled_targets: set[str] = set()
+        for entry in self._pending:
+            for target in entry.get("targets") or []:
+                if target in scheduled_targets:
+                    continue
+                scheduled_targets.add(target)
+                state = self._target_state.get(target) or {}
+                if now < float(state.get("next_at", 0) or 0):
+                    continue  # 退避中：该目标本轮不尝试，其更新条目也不越级
+                scheduled.append((entry, target))
+                if len(scheduled) >= PENDING_MAX_ATTEMPTS_PER_CYCLE:
+                    break
+            if len(scheduled) >= PENDING_MAX_ATTEMPTS_PER_CYCLE:
+                break
+
+        if not scheduled:
+            if changed:
+                self._save_pending()
+            return
+
+        # 3) 有限并发执行：return_exceptions 确保单子任务意外异常不影响其它子任务
+        semaphore = asyncio.Semaphore(PENDING_MAX_CONCURRENT_SENDS)
+
+        async def _guarded(entry: dict, target: str) -> tuple[str, str]:
+            async with semaphore:
+                try:
+                    return await self._attempt_send(entry, target)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:  # 意外异常按失败处理，其它目标继续
+                    logger.error(
+                        "%s 发送尝试意外异常 target=%s（已按失败处理）：%s",
+                        PLUGIN_NAME,
+                        target,
+                        type(e).__name__,
+                    )
+                    return "error", f"{type(e).__name__}（详情见日志）"
+
+        outcomes = await asyncio.gather(
+            *(_guarded(entry, target) for entry, target in scheduled),
+            return_exceptions=True,
+        )
+
+        # 4) 串行应用结果（避免并发改表）；成功结果必须保留
+        cancelled: asyncio.CancelledError | None = None
+        for (entry, target), outcome in zip(scheduled, outcomes):
+            if isinstance(outcome, asyncio.CancelledError):
+                cancelled = outcome  # 取消：等待所有子任务结束后再传播
+                continue
+            if isinstance(outcome, BaseException):
+                logger.error(
+                    "%s 发送结果异常 target=%s（按失败处理）：%s",
+                    PLUGIN_NAME,
+                    target,
+                    type(outcome).__name__,
+                )
+                status = "error"
+            else:
+                status, _detail = outcome
+            if status == "ok":
+                if target in entry.get("targets", []):
+                    entry["targets"].remove(target)
+                self._target_state.pop(target, None)
+            else:
+                prev = int(
+                    (self._target_state.get(target) or {}).get("failures", 0) or 0
+                )
+                failures = min(prev + 1, PENDING_BACKOFF_MAX_FAILURES)
+                self._target_state[target] = {
+                    "failures": failures,
+                    "next_at": time.time() + self._backoff_delay(failures),
+                }
+        self._pending = [e for e in self._pending if e.get("targets")]
+        self._save_pending()
+        if cancelled is not None:
+            raise cancelled

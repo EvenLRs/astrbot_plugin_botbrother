@@ -74,6 +74,26 @@ def _plain_text(chain):
     return "".join(parts)
 
 
+class _FakeAstrBotConfigManager:
+    """最小 Context 依赖。
+
+    AstrBot 4.28 的 ``Context.send_message`` 在调用平台发送后会执行
+    ``self.get_config(umo=str(session))`` → ``self.astrbot_config_mgr.get_conf(umo)``。
+    以 ``_attach_astrbot_config_mgr(object.__new__(Context))`` 构造的测试夹具需补齐该属性，否则发送已发生
+    却在随后抛 AttributeError（表现为告警已发出但被当作失败进入退避）。
+    返回空配置即可（不启用群历史持久化），不 mock 被测的 send 行为。
+    """
+
+    def get_conf(self, umo=None):
+        return {}
+
+
+def _attach_astrbot_config_mgr(ctx):
+    """给测试 Context 夹具补齐 4.28 所需的 astrbot_config_mgr。"""
+    ctx.astrbot_config_mgr = _FakeAstrBotConfigManager()
+    return ctx
+
+
 @unittest.skipUnless(HAS_ASTRBOT, "AstrBot 未安装，跳过集成冒烟测试")
 class PluginRegistrationTest(unittest.TestCase):
     """插件必须以 @register 注册，且事件处理器仅接受 AIOCQHTTP。"""
@@ -171,7 +191,7 @@ class LifecycleSmokeTest(unittest.TestCase):
         class FakePlatformManager:
             platform_insts = []
 
-        ctx = object.__new__(Context)
+        ctx = _attach_astrbot_config_mgr(object.__new__(Context))
         ctx.platform_manager = FakePlatformManager()
         ctx.platform_manager.platform_insts = [self.platform]
         self.context = ctx
@@ -192,6 +212,18 @@ class LifecycleSmokeTest(unittest.TestCase):
         }
         return self.main.BotBrotherMonitor(self.context, cfg)
 
+    async def _quiesce_worker(self, plugin):
+        """停掉 initialize 启动的通知 worker，便于测试精确控制发送时机。"""
+        task = plugin._worker_task
+        plugin._worker_task = None
+        plugin._worker_wakeup = None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     def test_probe_mapping(self):
         async def run():
             plugin = self._make_plugin()
@@ -211,7 +243,7 @@ class LifecycleSmokeTest(unittest.TestCase):
             self.assertEqual(state, UNREACHABLE)
             self.assertIn("ws down", detail)
             # unreachable: no platform instance
-            ctx2 = object.__new__(Context)
+            ctx2 = _attach_astrbot_config_mgr(object.__new__(Context))
             ctx2.platform_manager = SimpleNamespace(platform_insts=[])
             plugin2 = self.main.BotBrotherMonitor(
                 ctx2,
@@ -235,11 +267,13 @@ class LifecycleSmokeTest(unittest.TestCase):
         async def run():
             plugin = self._make_plugin()
             await plugin.initialize()
+            await self._quiesce_worker(plugin)
             self.bot.responses = [{"online": False}] * 10
             # 模拟 3 次连续故障后告警一次
             for _ in range(3):
                 state, detail = await plugin._probe()
                 await plugin._feed_and_notify(state, detail)
+            await plugin._drain_once()
             self.assertEqual(len(self.platform.sent), 1, "去抖后应只推送一次告警")
             # 推送负载必须是单条完整文案：不得重复附加 self_id/标题/详情
             self.assertEqual(
@@ -249,6 +283,7 @@ class LifecycleSmokeTest(unittest.TestCase):
             # 后续同故障不重复推送
             state, detail = await plugin._probe()
             await plugin._feed_and_notify(state, detail)
+            await plugin._drain_once()
             self.assertEqual(len(self.platform.sent), 1)
             await plugin.terminate()
 
@@ -258,14 +293,17 @@ class LifecycleSmokeTest(unittest.TestCase):
         async def run():
             plugin = self._make_plugin()
             await plugin.initialize()
+            await self._quiesce_worker(plugin)
             self.bot.responses = [{"online": False}] * 3 + [{"online": True}] * 10
             for _ in range(3):
                 state, detail = await plugin._probe()
                 await plugin._feed_and_notify(state, detail)
+            await plugin._drain_once()
             self.assertEqual(len(self.platform.sent), 1)
             for _ in range(3):  # 连续 3 次 online -> 恢复
                 state, _ = await plugin._probe()
                 await plugin._feed_and_notify(state)
+            await plugin._drain_once()
             self.assertEqual(len(self.platform.sent), 2, "恢复通知应补发一次")
             self.assertEqual(
                 _plain_text(self.platform.sent[1][1]),
@@ -319,7 +357,7 @@ class LifecycleSmokeTest(unittest.TestCase):
                 return {"online": False}
 
         async def run():
-            ctx = object.__new__(Context)
+            ctx = _attach_astrbot_config_mgr(object.__new__(Context))
             ctx.platform_manager = SimpleNamespace(
                 platform_insts=[
                     FlakyPlatform("bad_channel", True),
@@ -340,21 +378,17 @@ class LifecycleSmokeTest(unittest.TestCase):
                 },
             )
             await plugin.initialize()
+            await self._quiesce_worker(plugin)
             for _ in range(3):
                 state, detail = await plugin._probe()
                 await plugin._feed_and_notify(state, detail)
+            await plugin._drain_once()
             self.assertEqual(len(sent), 1, "正常目标应收到告警")
             self.assertEqual(sent[0], "good_channel:FriendMessage:2")
             self.assertEqual(
-                tried[0], "bad_channel:GroupMessage:1", "故障目标也应被尝试过"
-            )
-            self.assertEqual(
-                tried,
-                [
-                    "bad_channel:GroupMessage:1",
-                    "good_channel:FriendMessage:2",
-                ],
-                "故障目标不得阻塞后续目标",
+                set(tried),
+                {"bad_channel:GroupMessage:1", "good_channel:FriendMessage:2"},
+                "故障目标也必须被尝试过，且不得阻塞后续目标",
             )
             await plugin.terminate()
 
@@ -376,7 +410,7 @@ class LifecycleSmokeTest(unittest.TestCase):
                 return self._meta
 
         async def run():
-            ctx = object.__new__(Context)
+            ctx = _attach_astrbot_config_mgr(object.__new__(Context))
             ctx.platform_manager = SimpleNamespace(platform_insts=[FakePlatform()])
             plugin = self.main.BotBrotherMonitor(
                 ctx,
@@ -412,7 +446,7 @@ class LifecycleSmokeTest(unittest.TestCase):
                 return self._meta
 
         async def run():
-            ctx = object.__new__(Context)
+            ctx = _attach_astrbot_config_mgr(object.__new__(Context))
             ctx.platform_manager = SimpleNamespace(platform_insts=[FakePlatform()])
             plugin = self.main.BotBrotherMonitor(
                 ctx,
@@ -457,7 +491,7 @@ class LifecycleSmokeTest(unittest.TestCase):
                 return self._bot
 
         async def run():
-            ctx = object.__new__(Context)
+            ctx = _attach_astrbot_config_mgr(object.__new__(Context))
             insts = [FakePlatform("my_napcat", "aiocqhttp")]
             ctx.platform_manager = SimpleNamespace(platform_insts=insts)
             plugin = self.main.BotBrotherMonitor(
@@ -498,7 +532,7 @@ class LifecycleSmokeTest(unittest.TestCase):
                 return self._bot
 
         async def run():
-            ctx = object.__new__(Context)
+            ctx = _attach_astrbot_config_mgr(object.__new__(Context))
             # 唯一的 aiocqhttp 平台实例 id 是 "real_napcat"，配置却填了 "other"
             ctx.platform_manager = SimpleNamespace(
                 platform_insts=[FakePlatform("real_napcat", "aiocqhttp")]
@@ -548,7 +582,7 @@ class LifecycleSmokeTest(unittest.TestCase):
         async def run():
             bot_a = FakeBot("bot_a")
             bot_b = FakeBot("bot_b")
-            ctx = object.__new__(Context)
+            ctx = _attach_astrbot_config_mgr(object.__new__(Context))
             ctx.platform_manager = SimpleNamespace(
                 platform_insts=[
                     FakePlatform("napcat_a", "aiocqhttp", bot_a),
@@ -595,7 +629,7 @@ class LifecycleSmokeTest(unittest.TestCase):
                 return self._bot
 
         async def run():
-            ctx = object.__new__(Context)
+            ctx = _attach_astrbot_config_mgr(object.__new__(Context))
             ctx.platform_manager = SimpleNamespace(
                 platform_insts=[
                     FakePlatform("shared_id", "qqchannel"),  # 同 ID 但非 aiocqhttp
@@ -622,7 +656,7 @@ class LifecycleSmokeTest(unittest.TestCase):
 
     def test_no_aiocqhttp_platform_reports_unreachable(self):
         async def run():
-            ctx = object.__new__(Context)
+            ctx = _attach_astrbot_config_mgr(object.__new__(Context))
             other = SimpleNamespace(
                 meta=lambda: SimpleNamespace(id="qqchannel", name="qqchannel"),
             )
